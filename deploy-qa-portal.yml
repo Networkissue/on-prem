@@ -1,0 +1,184 @@
+name: Deploy to App Engine (QA build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Source Dev Tag (e.g., dev-20250428-151214)'
+        required: true
+      target_tag:
+        description: 'Target QA Tag (e.g., qa-20250428-151214)'
+        required: true
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'qa'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout qa branch
+        uses: actions/checkout@v3
+        with:
+          ref: qa
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch all tags
+        run: git fetch --tags
+
+      - name: Read current QA version
+        id: current_version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Checkout dev branch
+        run: git checkout dev
+      
+      - name: Verify that tag exists
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/${{ github.event.inputs.source_tag }}"; then
+            echo "❌ ERROR: Tag ${{ github.event.inputs.source_tag }} not found!"
+            exit 1
+          fi
+
+      - name: Checkout to specific tag
+        run: git checkout ${{ github.event.inputs.source_tag }}
+
+      - name: Force Merge Dev Tag into QA Branch
+        run: |
+          git checkout qa
+          git merge ${{ github.event.inputs.source_tag }} --strategy-option theirs --no-edit || echo "Force merge completed"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Replace Auth0 domain in AndroidManifest.xml
+        run: |
+          sed -i 's|android:host="stemi-2dot0-dev.us.auth0.com"|android:host="stemi-2dot0-qa.us.auth0.com"|g' android/app/src/main/AndroidManifest.xml
+
+      - name: Replace FCM registration URL in AppDelegate.swift
+        run: |
+          sed -i "s|https://stemi-pns-service-dot-stemi-dev-444316.ue.r.appspot.com/register-fcm-token-ios|https://stemi-pns-service-dot-stemi-qa.uc.r.appspot.com/register-fcm-token-ios|g" ios/App/App/AppDelegate.swift
+
+      - name: Replace Patient Service URL in Info.plist
+        run: |
+          sed -i "s/-stemi-dev-444316\.ue/-stemi-qa.uc/g" ios/App/App/Info.plist
+
+      - name: Replace dev values in environment.ts
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          FILE="environment.ts"
+
+          echo "🔧 Updating environment.ts for environment: $ENV"
+
+          if [ ! -f "$FILE" ]; then
+            echo "❌ ERROR: $FILE not found!"
+            exit 1
+          fi
+
+          # 1. Replace DEPLOYMENT value
+          sed -i "s/DEPLOYMENT: *['\"][^'\"]*['\"]/DEPLOYMENT: '$ENV'/" "$FILE"
+
+          # 2. Replace DOMAIN value
+          sed -i "s|stemi-2dot0-dev|stemi-2dot0-qa|g" "$FILE"
+
+          # 3. Replace all -stemi-dev-444316 occurrences
+          sed -i "s/-stemi-dev-444316\.ue/-stemi-${ENV}.uc/g" "$FILE"
+          sed -i "s/-stemi-qa\.ue/-stemi-${ENV}.uc/g" "$FILE"
+
+          echo "✅ environment.ts after replacements:"
+          cat "$FILE"
+
+      - name: Install Dependencies
+        run: npm install
+          
+      - name: Bump QA version
+        id: versioning
+        run: |
+          OLD_VERSION=${{ steps.current_version.outputs.current_version }}
+          MAJOR=$(echo $OLD_VERSION | cut -d. -f1)
+          MINOR=$(echo $OLD_VERSION | cut -d. -f2)
+          PATCH=$(echo $OLD_VERSION | cut -d. -f3 | sed 's/-.*//')  # clean if already -qa
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-qa"
+
+          echo "Updating version to $NEW_VERSION"
+
+          node -e "let p=require('./package.json'); p.version='$NEW_VERSION'; require('fs').writeFileSync('package.json', JSON.stringify(p, null, 2))"
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Update Android versionName and versionCode in build.gradle
+        run: |
+          NEW_VERSION="${{ steps.versioning.outputs.new_version }}"
+          GRADLE_FILE="android/app/build.gradle"
+          
+          echo "Updating versionName to $NEW_VERSION in $GRADLE_FILE"
+
+          # Extract current versionCode
+          CURRENT_CODE=$(grep versionCode $GRADLE_FILE | grep -o '[0-9]\+')
+          NEW_CODE=$((CURRENT_CODE + 1))
+
+          echo "Updating versionCode to $NEW_CODE"
+
+          # Replace versionCode and versionName
+          sed -i -E "s/versionCode [0-9]+/versionCode $NEW_CODE/" "$GRADLE_FILE"
+          sed -i -E "s/versionName \".*\"/versionName \"$NEW_VERSION\"/" "$GRADLE_FILE"
+
+          # Show updated lines
+          grep "versionCode" $GRADLE_FILE
+          grep "versionName" $GRADLE_FILE
+
+      - name: Build the Portal source code
+        run: npm run build
+      
+      - name: Save new version to file
+        run: echo "${{ steps.versioning.outputs.new_version }}" > version.txt
+
+      - name: Upload version.txt as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: version
+          path: version.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY_QA }}'
+
+      - name: Set GCP Project to QA
+        run: gcloud config set project stemi-qa
+      
+      - name: Show Deploying Version
+        run: |
+          echo "🚀 Deploying version: ${{ steps.versioning.outputs.new_version }}"
+
+      - name: Deploy to App Engine
+        run: gcloud app deploy app.yaml --quiet
+  
+      - name: Commit and push updated package.json and environment.ts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json ./environment.ts
+          git commit -m "ci: bump version to ${{ steps.versioning.outputs.new_version }} and update environment.ts for QA" -a
+          git push origin qa
+
+      - name: Create and Push Git Tag
+        run: |
+          git fetch --tags
+          TAG_NAME="${{ github.event.inputs.target_tag }}"
+          echo "Creating and pushing tag $TAG_NAME"
+          
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
