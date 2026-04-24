@@ -1,0 +1,119 @@
+name: Deploy to App Engine (dev build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name to use for deployment (e.g., v1.0.6-dev-20250428T114500)'
+        required: true
+
+permissions:
+  contents: write  
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout dev branch
+        uses: actions/checkout@v3
+        with:
+          ref: dev
+          fetch-depth: 0  # Important: fetch full history to allow merging
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Pull latest from origin/main and merge into dev
+        run: |
+          git fetch origin main
+          git merge origin/main --no-edit || echo "Merge completed with conflicts or no changes"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Pull latest code (safe fetch)
+        run: git pull origin dev
+
+      - name: Install Dependencies
+        run: npm install
+          
+      - name: Update version with patch bump and timestamp
+        id: versioning
+        run: |
+          # Current environment
+          ENV="dev"
+          echo "Environment: $ENV"
+          
+          # Get current version
+          VERSION=$(node -p "require('./package.json').version")
+          echo "Current version: $VERSION"
+
+          # Extract MAJOR, MINOR, PATCH
+          MAJOR=$(echo $VERSION | cut -d. -f1)
+          MINOR=$(echo $VERSION | cut -d. -f2)
+          PATCH_WITH_SUFFIX=$(echo $VERSION | cut -d. -f3)
+          PATCH=$(echo $PATCH_WITH_SUFFIX | cut -d+ -f1)
+
+          # Bump patch
+          NEW_PATCH=$((PATCH + 1))
+
+          # Add timestamp
+          #TIMESTAMP=$(date -u +%Y%m%dT%H%M%S)
+         
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-${ENV}"
+
+          echo "New bumped version: $NEW_VERSION"
+
+          # Update package.json
+          node -e "let p=require('./package.json'); p.version='$NEW_VERSION'; require('fs').writeFileSync('package.json', JSON.stringify(p, null, 2))"
+
+          # Output version
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build the Portal source code
+        run: npm run build
+
+      - name: Save new version to file
+        run: echo "${{ steps.versioning.outputs.new_version }}" > version.txt
+
+      - name: Upload version.txt as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: version
+          path: version.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY }}'
+      
+      - name: Set GCP Project
+        run: gcloud config set project stemi-dev-444316
+
+      - name: Show Deploying Version
+        run: |
+          echo "🚀 Deploying version: ${{ steps.versioning.outputs.new_version }}"
+
+      - name: Deploy to App Engine
+        run: gcloud app deploy app.yaml --quiet
+
+      - name: Commit and push updated package.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "ci: bump version to ${{ steps.versioning.outputs.new_version }}" -a
+          git push origin dev
+
+      - name: Create and Push Git Tag
+        run: |
+          git fetch --tags
+          TAG_NAME="${{ github.event.inputs.tag_name }}"
+          echo "Creating and pushing tag $TAG_NAME"
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
