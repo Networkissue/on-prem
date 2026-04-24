@@ -1,0 +1,133 @@
+name: Deploy to App Engine (QA build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Source Dev Tag (e.g., dev-20250428-151214)'
+        required: true
+      target_tag:
+        description: 'Target QA Tag (e.g., qa-20250428-151214)'
+        required: true
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'qa'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout qa branch
+        uses: actions/checkout@v3
+        with:
+          ref: qa
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch all tags
+        run: git fetch --tags
+
+      - name: Read current QA version
+        id: current_version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Checkout dev branch
+        run: git checkout dev
+      
+      - name: Verify that tag exists
+        run: |
+          if ! git rev-parse -q --verify "refs/tags/${{ github.event.inputs.source_tag }}"; then
+            echo "❌ ERROR: Tag ${{ github.event.inputs.source_tag }} not found!"
+            exit 1
+          fi
+
+      - name: Checkout to specific tag
+        run: git checkout ${{ github.event.inputs.source_tag }}
+
+      - name: Force Merge Dev Tag into QA Branch
+        run: |
+          git checkout qa
+          git merge ${{ github.event.inputs.source_tag }} --strategy-option theirs --no-edit || echo "Force merge completed"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Backup original app.yaml
+        run: cp app.yaml app.original.yaml
+
+      - name: Copy app-qa.yaml to app.yaml
+        run: cp app-qa.yaml app.yaml
+        working-directory: ${{ github.workspace }}
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Bump QA version
+        id: versioning
+        run: |
+          OLD_VERSION=${{ steps.current_version.outputs.current_version }}
+          MAJOR=$(echo $OLD_VERSION | cut -d. -f1)
+          MINOR=$(echo $OLD_VERSION | cut -d. -f2)
+          PATCH=$(echo $OLD_VERSION | cut -d. -f3 | sed 's/-.*//')  # clean if already -qa
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}-qa"
+
+          echo "Updating version to $NEW_VERSION"
+
+          node -e "let p=require('./package.json'); p.version='$NEW_VERSION'; require('fs').writeFileSync('package.json', JSON.stringify(p, null, 2))"
+
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+      
+      - name: Save new version to file
+        run: echo "${{ steps.versioning.outputs.new_version }}" > version.txt
+
+      - name: Upload version.txt as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: version
+          path: version.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCP_SA_KEY_QA }}'
+
+      - name: Set GCP Project to QA
+        run: gcloud config set project stemi-qa
+      
+      - name: Show Deploying Version
+        run: |
+          echo "🚀 Deploying version: ${{ steps.versioning.outputs.new_version }}"
+
+      - name: Deploy to App Engine
+        run: gcloud app deploy app.yaml --quiet
+      
+      - name: Restore original app.yaml
+        run: mv app.original.yaml app.yaml
+
+      - name: Commit and push updated package.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json
+          git commit -m "ci: bump version to ${{ steps.versioning.outputs.new_version }}"
+          git push origin qa
+
+      - name: Create and Push Git Tag
+        run: |
+          git fetch --tags
+          TAG_NAME="${{ github.event.inputs.target_tag }}"
+          echo "Creating and pushing tag $TAG_NAME"
+
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
